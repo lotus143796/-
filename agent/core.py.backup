@@ -1,0 +1,140 @@
+import json
+import re
+from typing import Dict, Any, List, Optional
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from agent.prompts import SYSTEM_PROMPT, get_review_prompt
+from agent.memory import AgentMemory
+from tools import (
+    run_linter, run_security_scan, analyze_dependencies,
+    analyze_project, search_code, apply_fix
+)
+from scanners.project_scanner import scan_project
+from utils.concurrent import run_parallel
+from tqdm import tqdm
+
+class CodeReviewAgent:
+    def __init__(self, api_key: str, model: str = "deepseek-chat", max_steps: int = 5):
+        self.llm = ChatOpenAI(
+            api_key=api_key,
+            base_url="https://api.deepseek.com/v1",
+            model=model,
+            temperature=0.2,
+        )
+        self.max_steps = max_steps
+        self.memory = AgentMemory()
+        self.steps_log = []
+
+    # ---------- 单文件审查（已有）----------
+    def run(self, code: str, file_path: str = None, repo_path: str = None) -> Dict[str, Any]:
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=get_review_prompt(code, file_path))
+        ]
+        self.steps_log = []
+        for step in range(self.max_steps):
+            response = self.llm.invoke(messages)
+            response_text = response.content
+            self.steps_log.append({"step": step+1, "response": response_text})
+            if "Final Answer:" in response_text:
+                return self._parse_final_answer(response_text)
+            action = self._parse_action(response_text)
+            if not action:
+                messages.append(AIMessage(content=response_text))
+                messages.append(HumanMessage(content="请按照格式继续。"))
+                continue
+            obs = self._execute_tool(action, code, file_path, repo_path)
+            self.memory.add_step(action["tool"], action["params"], obs)
+            messages.append(AIMessage(content=response_text))
+            messages.append(HumanMessage(content=f"Observation: {obs}"))
+        return self._force_report("达到最大步数")
+
+    # ---------- 批量项目审查（新增）----------
+    def run_on_project(self, project_path: str, extensions: List[str] = None) -> Dict[str, Any]:
+        """审查整个文件夹，返回汇总报告"""
+        files = scan_project(project_path, extensions)
+        if not files:
+            return {"error": "未找到任何代码文件"}
+
+        # 并发分析每个文件
+        def analyze_one(file_info):
+            file_path = file_info["path"]
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                code = f.read()
+            result = self.run(code, file_path=file_path, repo_path=project_path)
+            return {"file": file_path, "result": result}
+
+        results = run_parallel(analyze_one, files, max_workers=4, desc="分析文件中")
+        # 汇总报告
+        all_issues = []
+        for r in results:
+            report = r.get("result", {}).get("report", {})
+            issues = report.get("issues", [])
+            for issue in issues:
+                issue["file"] = r["file"]
+                all_issues.append(issue)
+        # 额外执行项目级分析（依赖图、循环依赖）
+        project_analysis = analyze_project(project_path)
+        return {
+            "summary": f"审查完成，共 {len(files)} 个文件，发现 {len(all_issues)} 个问题",
+            "files_analyzed": len(files),
+            "issues": all_issues,
+            "project_analysis": project_analysis,
+            "per_file_results": results
+        }
+
+    # ---------- 辅助方法 ----------
+    def _parse_action(self, response: str) -> Optional[Dict]:
+        pattern = r'Action:\s*(\w+)\s*\(\s*({.*?})\s*\)'
+        match = re.search(pattern, response, re.DOTALL)
+        if match:
+            tool_name = match.group(1)
+            try:
+                params = json.loads(match.group(2))
+            except:
+                try:
+                    params = eval(match.group(2))
+                except:
+                    params = {}
+            return {"tool": tool_name, "params": params}
+        return None
+
+    def _execute_tool(self, action: Dict, code: str, file_path: str, repo_path: str) -> str:
+        tool_name = action["tool"]
+        params = action.get("params", {})
+        tools_map = {
+            "run_linter": lambda: run_linter(params.get("file_path", file_path), code),
+            "run_security_scan": lambda: run_security_scan(code),
+            "analyze_dependencies": lambda: analyze_dependencies(code),
+            "analyze_project": lambda: analyze_project(repo_path or "."),
+            "search_code": lambda: search_code(code, params.get("pattern", "")),
+            "apply_fix": lambda: apply_fix(code, params.get("issue", {})),
+        }
+        if tool_name in tools_map:
+            try:
+                return tools_map[tool_name]()
+            except Exception as e:
+                return f"工具执行失败: {str(e)}"
+        return f"未知工具: {tool_name}"
+
+    def _parse_final_answer(self, response: str) -> Dict[str, Any]:
+        match = re.search(r'Final Answer:\s*(.*?)$', response, re.DOTALL)
+        answer_text = match.group(1) if match else response
+        try:
+            json_match = re.search(r'```json\s*(.*?)\s*```', answer_text, re.DOTALL)
+            if json_match:
+                report_data = json.loads(json_match.group(1))
+            else:
+                report_data = json.loads(answer_text)
+        except:
+            report_data = {"summary": answer_text, "issues": []}
+        return {"report": report_data, "steps": self.steps_log, "memory": self.memory.get_summary()}
+
+    def _force_report(self, reason: str) -> Dict[str, Any]:
+        return {"report": {"summary": f"分析未完成：{reason}"}, "steps": self.steps_log, "error": reason}
+
+    def visualize_steps(self) -> str:
+        output = []
+        for step in self.steps_log:
+            output.append(f"## Step {step['step']}\n{step['response']}\n" + "-"*40)
+        return "\n".join(output)

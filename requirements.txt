@@ -1,0 +1,13 @@
+langchain>=0.3.0
+langchain-openai>=0.2.0
+openai>=1.54.0
+streamlit>=1.38.0
+pylint>=3.0.0
+pylint-quotes>=0.2.0
+bandit>=1.7.0
+python-dotenv>=1.0.0
+pygments>=2.18.0
+tree-sitter>=0.20.0
+tree-sitter-languages>=1.10.0
+tqdm>=4.66.0
+unidiff>=0.7.0
